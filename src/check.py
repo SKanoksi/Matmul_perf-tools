@@ -1,6 +1,6 @@
 import numpy as np
 
-iter_range = np.arange(10)
+iter_range = np.arange(0,100,10)
 float_datatype = np.float64
 
 isBinary = True
