@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -p compute-devel       # Partition
+#SBATCH -p compute             # Partition
 #SBATCH -N 1                   # Number of node
 #SBATCH --ntasks-per-node=1    # Number of MPI processes per node
 #SBATCH --cpus-per-task=1      # Number of OpenMP threads per MPI process
@@ -11,7 +11,7 @@ module reset
 module swap PrgEnv-cray PrgEnv-gnu
 module load perftools-lite
 
-CC -o ./matmul_lite.exe -I../src ../src/matmul_main.cpp 
+CC -DUSE_ALGOR=1 -O3 -o ./matmul_lite.exe -I../src ../src/matmul_main.cpp 
 
 srun ./matmul_lite.exe 25 1000 1000 1000
 
