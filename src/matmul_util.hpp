@@ -1,10 +1,11 @@
 /******************************************************************\
 
-  Matmul -- perf tools
+  Matmul -- Perf. tools
 
-  Version 1.0.0
+  Version 2.0.0
   Copyright (c) 2026, Somrath Kanoksirirath <somrathk@gmail.com>
   All rights reserved under BSD 3-clause license.
+
 \******************************************************************/
 
 #ifndef MATMUL_UTIL_HPP
@@ -16,46 +17,62 @@
 #include <string>
 #include <iomanip>
 #include <chrono>
+#include <thread>
 
-#include "matmul_setup.hpp"
+#if USE_ALGOR==4 && SELECT_BLAS==2
+  #include <cuda_runtime.h>
+  #include <curand.h>
+#endif
 
+#include <matmul_setup.hpp>
 
-inline void partition_dim(std::size_t &start_x, std::size_t &local_size_x, std::size_t &stripe_size_x, 
-     	                  const std::size_t id, const std::size_t group_size, const std::size_t x_size)
+inline void partition_dim(int &start_x, int &local_size_x, int &stripe_size_x, int &remaining,
+     	                  const int id, const int group_size, const int x_size)
 {
-  std::size_t temp_size_x = x_size/group_size ;
-  temp_size_x = (group_size*temp_size_x < x_size) ? temp_size_x+1 : temp_size_x ;
+  int temp = x_size/group_size ;
+  stripe_size_x = (group_size*temp < x_size) ? temp+1 : temp ;
 
-  stripe_size_x = temp_size_x ;
-  start_x = id*stripe_size_x ;
-
-  temp_size_x = (id+1) * stripe_size_x ;
-  temp_size_x = (temp_size_x<x_size) ? temp_size_x : x_size ; // end_x
-  local_size_x = temp_size_x - start_x ;
+  remaining = x_size - group_size*temp ;
+  if( id < remaining ){   // < condition since id starts from 0
+    local_size_x = temp+1 ;
+    start_x = local_size_x*id ;
+  }else{
+    local_size_x = temp ;
+    start_x = remaining + local_size_x*id ;
+  }
 
 return; }
-
 
 #if USE_OMP>0
 static thread_local std::mt19937_64 gen;
 #else
+#if USE_ALGOR==4 && SELECT_BLAS==2
+static curandGenerator_t gen ;
+#else
 static std::mt19937_64 gen;
 #endif
+#endif
 
-void init_random_gen()
+void init_random_gen(const int seed_offset=0)
 {
 #if USE_OMP>0
   #pragma omp parallel
   {
     std::random_device rd ;
-    gen.seed(rd() ^ (uint64_t)omp_get_thread_num());
+    gen.seed((rd()+seed_offset) ^ (uint64_t)omp_get_thread_num());
   }
 #else
+#if USE_ALGOR==4 && SELECT_BLAS==2
+  curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT);
+  curandSetPseudoRandomGeneratorSeed(gen, 1234ULL+seed_offset);
+#else
   std::random_device rd;
-  gen.seed(rd());
+  gen.seed(rd()+seed_offset);
+#endif
 #endif
 }
 
+#if USE_ALGOR!=4 || SELECT_BLAS!=2
 inline uint32_t fast_hash(uint32_t x) 
 {
   x = ((x >> 16) ^ x) * 0x45d9f3b;
@@ -63,11 +80,20 @@ inline uint32_t fast_hash(uint32_t x)
   x = (x >> 16) ^ x;
   return x;
 }
+#endif
 
 template <typename U>
 void init_random(U *__restrict A, std::size_t array_size, const U min_rand=-1.0, const U max_rand=1.0)
 {
-#if USE_OMP==1
+#if USE_ALGOR==4 && SELECT_BLAS==2
+  if constexpr ( sizeof(U) == 8 )
+    curandGenerateNormalDouble(gen, A, array_size, (max_rand+min_rand)/2, (max_rand-min_rand)/2);
+  else
+    curandGenerateNormal(gen, A, array_size, (max_rand+min_rand)/2, (max_rand-min_rand)/2);
+  cudaDeviceSynchronize();
+#else
+
+#if USE_OMP>0
   #pragma omp parallel
   {
 #endif
@@ -80,9 +106,11 @@ void init_random(U *__restrict A, std::size_t array_size, const U min_rand=-1.0,
     {
       A[i] = min_rand + (max_rand - min_rand) * (static_cast<U>(fast_hash(seed + (uint32_t)i))/static_cast<U>(UINT32_MAX)) ;
     }
-#if USE_OMP==1
+#if USE_OMP>0
   }
 #endif
+
+#endif // USE_ALGOR==4 && SELECT_BLAS==2
 
 return; }
 
@@ -151,7 +179,7 @@ bool write_array(const std::size_t num_row, const std::size_t num_col,
 }
 
 
-enum clock_type { all=0, computation=1 } ;
+enum clock_type { prog=0, loop=1 } ;
 
 #if USE_TIMER>0
 

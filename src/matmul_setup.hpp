@@ -1,28 +1,20 @@
-/******************************************************************\
-
-  Matmul -- perf tools
-
-  Version 1.0.0
-  Copyright (c) 2026, Somrath Kanoksirirath <somrathk@gmail.com>
-  All rights reserved under BSD 3-clause license.
-\******************************************************************/
 
 #ifndef MATMUL_SETUP_HPP
 #define MATMUL_SETUP_HPP
 
 // *** General ***
-constexpr int  DEFAULT_NUM_REPEAT = 100 ; // arg0
+constexpr int  DEFAULT_NUM_REPEAT = 20 ; // arg0
 
 // *** Matrix size ***
 // {M,P} = {M,N} x {N,P}
-constexpr int  DEFAULT_MATRIX_M_SIZE = 3000 ; // arg1
-constexpr int  DEFAULT_MATRIX_N_SIZE = 3000 ; // arg2
-constexpr int  DEFAULT_MATRIX_P_SIZE = 3000 ; // arg3
+constexpr int  DEFAULT_MATRIX_M_SIZE = 1000 ; // arg1
+constexpr int  DEFAULT_MATRIX_N_SIZE = 1000 ; // arg2
+constexpr int  DEFAULT_MATRIX_P_SIZE = 1000 ; // arg3
 
 // *** Block size (for ALGOR=2,3) *** 
-constexpr int  BLOCK_M_SIZE = 1000 ; 
-constexpr int  BLOCK_N_SIZE = 1000 ;
-constexpr int  BLOCK_P_SIZE = 1000 ; 
+constexpr int  BLOCK_M_SIZE = 200 ; 
+constexpr int  BLOCK_N_SIZE = 200 ;
+constexpr int  BLOCK_P_SIZE = 200 ; 
 
 // *** Micro size (for ALGOR=3) ***
 constexpr int  MICRO_M_SIZE = 2 ;
@@ -46,7 +38,7 @@ constexpr int  MICRO_P_SIZE = 2 ;
   #define SELECT_BLAS 0
 //  0 = cblas.h
 //  1 = mkl.h
-//  2 = libsci_acc.h 
+//  2 = libsci_acc.h (GPU)
 #endif
 
 
@@ -58,20 +50,25 @@ using Float = double ;
 
 
 // *** Parallel (default) ***
-#if !defined(USE_MPI)
-  #define USE_MPI 0
-//  0 = No OpenMP
-//  1 = Blocking
-//  2 = Non-blocking
-#endif
 #if !defined(USE_OMP)
   #define USE_OMP 0
 //  0 = No OpenMP
 //  1 = Simple, omp parallel for
-//  2 = Separate, omp parallel + omp for
 #endif
-#if USE_ALGOR==4 && SELECT_BLAS==2 && USE_OMP!=0
-  #error "Using libsci_acc.h with OpenMP is NOT supported."
+#if !defined(USE_MPI)
+  #define USE_MPI 0
+//  0 = No MPI
+//  1 = Blocking, MPI_Bcast
+//  2 = Non-blocking, MPI_Ibcast
+//  3 = Non-blocking, MPI_Igatherv
+#endif
+#if !defined(NUM_SPLIT_MPI_CALL)
+  #define NUM_SPLIT_MPI_CALL 1
+#endif
+#if !defined(USE_MPI_GPU_DIRECT)
+  #define USE_MPI_GPU_DIRECT 0
+//  0 = Standard MPI
+//  1 = with GPUDirect RDMA
 #endif
 
 
@@ -86,19 +83,10 @@ using Float = double ;
   #define USE_TXT_FORMAT 0
 #endif
 #if !defined(USE_MPI_IO)
-  #if USE_MPI==1
-    #define USE_MPI_IO 1  // Non-collective
-  #elif USE_MPI>1
-    #define USE_MPI_IO 2  // Collective
-  #else
-    #define USE_MPI_IO 0  // Gather -> Serial
-  #endif
-#endif
-#if USE_MPI_IO>0 && USE_MPI<1
-  #error "USE_MPI_IO>0 needs USE_MPI>0"
-#endif
-#if USE_MPI_IO>0 && USE_TXT_FORMAT!=0
-  #error "USE_MPI_IO>0 does NOT support writing in text format"
+  #define USE_MPI_IO 0
+//  0 = Gather -> Serial  
+//  1 = Non-collective
+//  2 = Collective
 #endif
 
 
@@ -117,14 +105,40 @@ using Float = double ;
 #endif
 
 
+// *** Checking sensible config ***
+#if USE_ALGOR==4 && SELECT_BLAS==2 && USE_OMP!=0
+  #error "Using libsci_acc.h with OpenMP is invalid."
+#endif
+#if USE_MPI_GPU_DIRECT!=0
+  #if !USE_ALGOR==4 || !SELECT_BLAS==2   
+    #warning "Using USE_MPI_GPU_DIRECT without libsci_acc.h, it will be ignored."
+    #undef USE_MPI_GPU_DIRECT
+    #define USE_MPI_GPU_DIRECT 0
+  #endif
+  #if USE_MPI==0  
+    #error "Using USE_MPI_GPU_DIRECT without MPI is invalid."
+  #endif
+#endif
+#if USE_MPI_IO>0 && USE_MPI<1
+  #error "USE_MPI_IO>0 needs USE_MPI>0"
+#endif
+#if USE_MPI_IO>0 && USE_TXT_FORMAT!=0
+  #warning "USE_MPI_IO>0 does NOT support writing in text format"
+  #undef USE_TXT_FORMAT 
+  #define USE_TXT_FORMAT 0
+#endif
+
+
 // --------------------------------------
 
+#if USE_ALGOR==3
 static_assert(BLOCK_M_SIZE % MICRO_M_SIZE == 0,
               "BLOCK_M_SIZE must be divisible by MICRO_M_SIZE.");
 static_assert(BLOCK_P_SIZE % MICRO_P_SIZE == 0,
               "BLOCK_P_SIZE must be divisible by MICRO_P_SIZE.");
 constexpr int NUM_PANEL_M = BLOCK_M_SIZE/MICRO_M_SIZE ;
 constexpr int NUM_PANEL_P = BLOCK_P_SIZE/MICRO_P_SIZE ;
+#endif
 
 
 #if defined(__AVX512F__)

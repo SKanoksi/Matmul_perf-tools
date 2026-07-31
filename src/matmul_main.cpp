@@ -1,13 +1,14 @@
 /******************************************************************\
 
-  Matmul -- perf tools
+  Matmul -- Perf. tools
 
-  Version 1.0.0
+  Version 2.0.0
   Copyright (c) 2026, Somrath Kanoksirirath <somrathk@gmail.com>
   All rights reserved under BSD 3-clause license.
+
 \******************************************************************/
 
-#include "matmul_setup.hpp"
+#include <matmul_setup.hpp>
 
 #if USE_MPI>0
   #include <mpi.h>
@@ -21,6 +22,10 @@
   #include <pat_api.h>
 #endif
 
+#if USE_MPI>2 || (USE_MPI>0 && WRITE_ARRAYS>0 && USE_MPI_IO<1)
+  #include <vector>
+#endif
+
 #include "matmul_util.hpp"
 #include "matmul_algor.hpp"
 
@@ -28,7 +33,6 @@
 static_assert(std::is_floating_point<Float>::value,
               "Float must be a floating point datatype."
               );
-
 
 #if USE_MPI_IO>0
 template <typename U, MPI_Datatype mpi_type>
@@ -62,10 +66,10 @@ int main(int argc, char *argv[])
 
 #if USE_OMP>0
   int mpi_provided;
-  MPI_Init_thread(&argc, &argv, MPI_THREAD_SERIALIZED, &mpi_provided);
-  if( mpi_provided < MPI_THREAD_SERIALIZED )
+  MPI_Init_thread(&argc, &argv, MPI_THREAD_FUNNELED, &mpi_provided);
+  if( mpi_provided < MPI_THREAD_FUNNELED )
   {
-    std::cerr << "The MPI_THREAD_SERIALIZED is NOT supported." << std::endl;
+    std::cerr << "The MPI_THREAD_FUNNELED is NOT supported." << std::endl;
     //MPI_Abort(MPI_COMM_WORLD, 1);
     MPI_Finalize();
   }
@@ -81,6 +85,9 @@ int main(int argc, char *argv[])
   constexpr int mpi_rank = 0, mpi_size = 1 ;
   int num_threads = 1 ;
 #endif // USE_MPI>0 -- Init MPI
+
+  reset_clock(mpi_rank, clock_type::loop);
+  start_clock(mpi_rank, clock_type::prog);
 
   int num_repeat = DEFAULT_NUM_REPEAT ;
   int m_size = DEFAULT_MATRIX_M_SIZE ;
@@ -115,24 +122,40 @@ int main(int argc, char *argv[])
 
 #if USE_MPI>0
   if( mpi_rank == 0 ){
-    std::cout << "Using " << mpi_size << " MPI processes" << std::endl;
+    std::cout 
+    << "Using " << mpi_size << " MPI processes --> " 
+#if USE_MPI==1
+    << "Blocking BCAST"
+#elif USE_MPI==2
+    << "Non-Blocking BCAST"
+#else
+    << "Non-Blocking ALLGATHER"
+#endif
+    << std::endl;
 #else
   {
-    std::cout << "Using 1 single process without MPI" << std::endl;
+    std::cout << "Without MPI" << std::endl;
 #endif
 #if USE_OMP>0
   #pragma omp parallel
   {
     if( omp_get_thread_num()==0 ){
       num_threads = omp_get_num_threads();
-      std::cout << "Using " << num_threads << " OMP threads" << std::endl;
+      std::cout 
+      << "Using " << num_threads << " OMP threads --> " 
+#if USE_OMP==1
+      << "omp parallel for"
+#else
+      << "omp parallel for collapse(n)"
+#endif
+      << std::endl;
     }
   }
 #else
-  std::cout << "Using 1 single thread without OpenMP" << std::endl;
+  std::cout << "Without OpenMP" << std::endl;
 #endif
   }
-
+ 
 #if USE_ALGOR==4 && SELECT_BLAS==2
   libsci_acc_init();
   if( mpi_rank == 0 )
@@ -141,66 +164,95 @@ int main(int argc, char *argv[])
 
   // ---
 
-  std::size_t start_row_m, num_row_m, stripe_size_m ;
-  partition_dim(start_row_m, num_row_m, stripe_size_m, 
-                mpi_rank, mpi_size, m_size);
+  int start_row_m, num_row_m, stripe_size_m, remaining_m ;
+#if USE_MPI>0 && (USE_ALGOR==2 || USE_ALGOR==3)
+  if( m_size % BLOCK_M_SIZE != 0 )
+  {
+    if( mpi_rank == 0 ){
+      std::cerr
+      << "\nINPUT_ERROR :: "
+      << "matrix_m_size must be divisible by BLOCK_M_SIZE.\n"
+      << std::endl;
+    }
+    //MPI_Abort(MPI_COMM_WORLD, 1);
+    MPI_Finalize();
+    return 1;
+  }
 
-#if WRITE_ARRAYS>0 && USE_MPI_IO>0
-  std::size_t start_row_n, num_row_n, stripe_size_n ;
-  partition_dim(start_row_n, num_row_n, stripe_size_n,
+  {
+    int start_block_m, num_block_m, stripe_block_m, remaining_block_m ; 
+    partition_dim(start_block_m, num_block_m, stripe_block_m, remaining_block_m,
+                  mpi_rank, mpi_size, m_size/BLOCK_M_SIZE);
+    
+    start_row_m   =     start_block_m * BLOCK_M_SIZE ;
+    num_row_m     =       num_block_m * BLOCK_M_SIZE ;
+    stripe_size_m =    stripe_block_m * BLOCK_M_SIZE ;
+    remaining_m   = remaining_block_m * BLOCK_M_SIZE ;
+  }
+#else
+  partition_dim(start_row_m, num_row_m, stripe_size_m, remaining_m,
+		mpi_rank, mpi_size, m_size);
+#endif
+
+#if USE_MPI>0 && WRITE_ARRAYS>0 && USE_MPI_IO<1
+  std::vector<int> mpi_aa_recv_size(mpi_size), mpi_cc_recv_size(mpi_size) ;
+  std::vector<int> mpi_aa_recv_disp(mpi_size), mpi_cc_recv_disp(mpi_size) ;
+
+  if( mpi_rank==0 )
+  {
+    MPI_Gather(&num_row_m, 1, MPI_INT, mpi_aa_recv_size.data(), 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Gather(&start_row_m, 1, MPI_INT, mpi_aa_recv_disp.data(), 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+    for(int i=0 ; i<mpi_size ; ++i)
+    {
+      mpi_cc_recv_size[i] = mpi_aa_recv_size[i] * p_size ;
+      mpi_cc_recv_disp[i] = mpi_aa_recv_disp[i] * p_size ;
+
+      mpi_aa_recv_size[i] *= n_size ;
+      mpi_aa_recv_disp[i] *= n_size ;
+    }
+
+  }else{
+    MPI_Gather(&num_row_m, 1, MPI_INT, nullptr, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Gather(&start_row_m, 1, MPI_INT, nullptr, 1, MPI_INT, 0, MPI_COMM_WORLD);
+  }
+#endif
+
+  // ---
+
+  int start_row_n = 0, num_row_n = n_size, stripe_size_n = n_size, remaining_n = 0 ;
+#if USE_MPI>2 || USE_MPI_IO>0
+  partition_dim(start_row_n, num_row_n, stripe_size_n, remaining_n,
                 mpi_rank, mpi_size, n_size);
+#endif
+
+  const int rand_B_start_index = (USE_MPI>2) ? start_row_n*p_size : 0  ;
+  const int rand_B_num_row = (USE_MPI>2) ? num_row_n : n_size ;
+
+#if USE_MPI>0 && USE_MPI<3 && defined(NUM_SPLIT_MPI_CALL)
+  constexpr int mpi_split_num_call = (int(NUM_SPLIT_MPI_CALL)<1) ? 1 : int(NUM_SPLIT_MPI_CALL) ;
+  int mpi_split_Bsize = (rand_B_num_row*p_size)/mpi_split_num_call ;
+  mpi_split_Bsize = (mpi_split_Bsize*mpi_split_num_call < rand_B_num_row*p_size) ? mpi_split_Bsize+1 : mpi_split_Bsize ;
+#else
+  constexpr int mpi_split_num_call = 1 ;
+  int mpi_split_Bsize = rand_B_num_row*p_size ;
+#endif
+
+#if USE_MPI>2
+  std::vector<int> mpi_bb_recv_size(mpi_size), mpi_bb_recv_disp(mpi_size) ;
+
+  MPI_Allgather(&num_row_n, 1, MPI_INT, mpi_bb_recv_size.data(), 1, MPI_INT, MPI_COMM_WORLD);
+  MPI_Allgather(&start_row_n, 1, MPI_INT, mpi_bb_recv_disp.data(), 1, MPI_INT, MPI_COMM_WORLD);
+
+  for(int i=0 ; i<mpi_size ; ++i)
+  {
+    mpi_bb_recv_size[i] *= p_size ;
+    mpi_bb_recv_disp[i] *= p_size ;
+  }
 #endif
 
   // ---
   
-#if USE_ALGOR==2 || USE_ALGOR==3
-  if( stripe_size_m % BLOCK_M_SIZE != 0 )
-  {
-    if( mpi_rank == 0 ){
-      std::cerr
-      << "\nINPUT_ERROR :: "
-      << "stripe_size_m, i.e., ceil(matrix_m_size/mpi_size), must be divisible by BLOCK_M_SIZE.\n"
-      << std::endl;
-    }
-#if USE_MPI>0
-    //MPI_Abort(MPI_COMM_WORLD, 1);
-    MPI_Finalize();
-#endif
-    return 1;
-  }
-
-  if( n_size % BLOCK_N_SIZE != 0 )
-  {
-    if( mpi_rank == 0 ){
-      std::cerr
-      << "\nINPUT_ERROR :: "
-      << "matrix_n_size must be divisible by BLOCK_N_SIZE.\n"
-      << std::endl;
-    }
-#if USE_MPI>0
-    //MPI_Abort(MPI_COMM_WORLD, 1);
-    MPI_Finalize();
-#endif
-    return 1;
-  }
-
-  if( p_size % BLOCK_P_SIZE != 0 )
-  {
-    if( mpi_rank == 0 ){
-      std::cerr
-      << "\nINPUT_ERROR :: "
-      << "matrix_p_size must be divisible by BLOCK_P_SIZE.\n"
-      << std::endl;
-    }
-#if USE_MPI>0
-    //MPI_Abort(MPI_COMM_WORLD, 1);
-    MPI_Finalize();
-#endif
-    return 1;
-  }
-#endif
-
-
   if( mpi_rank == 0 )
   {
     std::cout
@@ -218,32 +270,19 @@ int main(int argc, char *argv[])
     << " <-- MPI"
     << std::endl;
 #endif
-#if USE_OMP>0
-#if USE_ALGOR!=2 && USE_ALGOR!=3 && USE_ALGOR!=4
-    std::cout
-    << "Working matrix size: "
-    << "[" << stripe_size_m/num_threads << "," << p_size << "] = ["
-    << stripe_size_m/num_threads << "," << n_size << "] x ["
-    << n_size << "," << p_size << "]"
-    << " <-- OpenMP"
-    << std::endl;
-#elif USE_ALGOR==2 || USE_ALGOR==3 || (USE_ALGOR==4 && USE_OMP==2)
-    std::cout
-    << "Working matrix size: "
-    << "[" << stripe_size_m << "," << p_size/num_threads << "] = ["
-    << stripe_size_m << "," << n_size << "] x ["
-    << n_size << "," << p_size/num_threads << "]"
-    << " <-- OpenMP"
-    << std::endl;
-#endif
-#endif
 #if USE_ALGOR==2 || USE_ALGOR==3
     std::cout
     << "  Matrix block size: "
     << "[" << BLOCK_M_SIZE << "," << BLOCK_P_SIZE << "] = ["
     << BLOCK_M_SIZE << "," << BLOCK_N_SIZE << "] x ["
     << BLOCK_N_SIZE << "," << BLOCK_P_SIZE << "]"
-    << " <-- Cache blocking"
+    << std::endl;
+#endif
+#if USE_ALGOR==3
+    std::cout
+    << "  Micro-kernel size: "
+    << "[" << MICRO_M_SIZE << "," << MICRO_P_SIZE << "] = ["
+    << MICRO_M_SIZE << ",1] x [1," << MICRO_P_SIZE << "]"
     << std::endl;
 #endif
     std::cout
@@ -254,18 +293,17 @@ int main(int argc, char *argv[])
     << "[2] = Loop interchange + Cache blocking (no packing)"
 #elif USE_ALGOR==3
     << "[3] = Micro kernel + Cache blocking (packing)"
-#if defined(ALGOR3_NO_MERGE_LOOP) && ALGOR3_NO_MERGE_LOOP>0
+#if defined(ALGOR2_NO_MERGE_LOOP) && ALGOR2_NO_MERGE_LOOP>0
     << " -- NO MERGE LOOP"
 #endif
-#if defined(ALGOR3_NO_MANUAL_VEC_KERNEL) && ALGOR3_NO_MANUAL_VEC_KERNEL>0
-    << " -- NO VEC KERNEL"
-#endif
-
 #elif USE_ALGOR==4
 #if SELECT_BLAS==1
     << "[4] = BLAS lvl3 from <mkl.h>"
 #elif SELECT_BLAS==2
     << "[4] = BLAS lvl3 from <libsci_acc.h>" 
+#if defined(USE_MPI_GPU_DIRECT) && USE_MPI_GPU_DIRECT!=0
+    << " -- GPUDirect"
+#endif
 #else
     << "[4] = BLAS lvl3 from <cblas.h>"
 #endif
@@ -274,39 +312,104 @@ int main(int argc, char *argv[])
 #endif
     << "\n" << std::endl;
 
-    reset_clock(mpi_rank, clock_type::all);
-    reset_clock(mpi_rank, clock_type::computation);
+    reset_clock(mpi_rank, clock_type::loop);
   }
+
+
+#if USE_ALGOR==2 || USE_ALGOR==3
+  if( num_row_m % BLOCK_M_SIZE != 0 )
+  {
+    std::cerr
+    << "\nINPUT_ERROR :: "
+#if USE_MPI<1
+    << "m_size must be divisible by BLOCK_M_SIZE.\n"
+#else
+    // Actually, should exit since above
+    << "[" << num_row_m << " % " << BLOCK_M_SIZE << " != 0] <-- "
+    << "num_row_m of rank " << mpi_rank << " must be divisible by BLOCK_M_SIZE.\n"
+#endif
+    << std::endl;
+
+#if USE_MPI>0
+    MPI_Abort(MPI_COMM_WORLD, 1);
+#endif
+    return 1;
+  }
+
+  if( n_size % BLOCK_N_SIZE != 0 )
+  {
+    if( mpi_rank == 0 ){
+      std::cerr
+      << "\nINPUT_ERROR :: "
+      << "matrix_n_size must be divisible by BLOCK_N_SIZE.\n"
+      << std::endl;
+    }
+#if USE_MPI>0
+    MPI_Abort(MPI_COMM_WORLD, 1);
+#endif
+    return 1;
+  }
+
+  if( p_size % BLOCK_P_SIZE != 0 )
+  {
+    if( mpi_rank == 0 ){
+      std::cerr
+      << "\nINPUT_ERROR :: "
+      << "matrix_p_size must be divisible by BLOCK_P_SIZE.\n"
+      << std::endl;
+    }
+#if USE_MPI>0
+    MPI_Abort(MPI_COMM_WORLD, 1);
+#endif
+    return 1;
+  }
+#endif
 
   // ------------------------------
 
-  const int alloc_size_m = (mpi_rank==0) ? m_size : stripe_size_m ;
-  Float *__restrict AA = (Float*)std::aligned_alloc(SIMD_ALIGNED_BYTE,
-                                                    alloc_size_m*n_size * sizeof(Float));
-  Float *__restrict BB = (Float*)std::aligned_alloc(SIMD_ALIGNED_BYTE,
-                                                    n_size*p_size * sizeof(Float));
-  Float *__restrict CC = (Float*)std::aligned_alloc(SIMD_ALIGNED_BYTE,
-                                                    (stripe_size_m*mpi_size)*p_size * sizeof(Float));
-
-#if USE_MPI>0
-  if( (stripe_size_m*mpi_size)*p_size * sizeof(Float) > 1024*1024*1024 && mpi_rank == 0 )
-  {
-    std::cout << "\n Warning :: your C matrix may be too large for MPI_Allgather\n" << std::endl;
-  }
-  if( n_size*p_size * sizeof(Float) > 1024*1024*1024 && mpi_rank == 0 )
-  {
-    std::cout << "\n Warning :: your B matrix may be too large for MPI_Bcast\n" << std::endl;
-  }
-#endif
-
+  const int alloc_size_m = (USE_MPI_IO==0 && mpi_rank==0) ? m_size : num_row_m ;
+  
+  Float *AA = (Float*)std::aligned_alloc(SIMD_ALIGNED_BYTE,
+                                         alloc_size_m*n_size * sizeof(Float));
+  Float *BB = (Float*)std::aligned_alloc(SIMD_ALIGNED_BYTE,
+                                               n_size*p_size * sizeof(Float));
+  Float *CC = (Float*)std::aligned_alloc(SIMD_ALIGNED_BYTE,
+                                         alloc_size_m*p_size * sizeof(Float));
 #if USE_ALGOR==4 && SELECT_BLAS==2
   Float *AA_device, *BB_device, *CC_device ;
-  libsci_acc_DeviceAlloc((void **)&AA_device, num_row_m*n_size * sizeof(Float));
-  libsci_acc_DeviceAlloc((void **)&BB_device,    n_size*p_size * sizeof(Float));
-  libsci_acc_DeviceAlloc((void **)&CC_device, num_row_m*p_size * sizeof(Float));
+  libsci_acc_DeviceAlloc((void **)&AA_device, alloc_size_m*n_size * sizeof(Float));
+  libsci_acc_DeviceAlloc((void **)&BB_device,       n_size*p_size * sizeof(Float));
+  libsci_acc_DeviceAlloc((void **)&CC_device, alloc_size_m*p_size * sizeof(Float));
+#endif
+  
+
+#if USE_MPI>0 
+#if WRITE_ARRAYS>0 && USE_MPI_IO<1
+  if( stripe_size_m*n_size * sizeof(Float) > 1024*1024*1024 && mpi_rank == 0 )
+  {
+      std::cout << "\n Warning :: your A matrix may be too large for Gather.\n" << std::endl;
+  }
+#endif
+#if USE_MPI>2
+  if( mpi_split_Bsize * sizeof(Float) > 1024*1024*1024 && mpi_rank == 0 )
+  {
+      std::cout << "\n Warning :: your B matrix may be too large for Allgather.\n" << std::endl;
+  }
+#else
+  if( mpi_split_Bsize * sizeof(Float) > 1024*1024*1024 && mpi_rank == 0 )
+  {
+      std::cout << "\n Warning :: your B matrix may be too large for Bcast.\n" << std::endl;
+  }
+#endif
+#if WRITE_ARRAYS>0 && USE_MPI_IO<1
+  if( stripe_size_m*p_size * sizeof(Float) > 1024*1024*1024 && mpi_rank == 0 )
+  {
+      std::cout << "\n Warning :: your C matrix may be too large for Gather.\n" << std::endl;
+  }
+#endif
 #endif
 
-  init_random_gen();
+  init_random_gen(mpi_rank);
 
 #if USE_MPI>0
   MPI_Barrier(MPI_COMM_WORLD);
@@ -314,91 +417,113 @@ int main(int argc, char *argv[])
 
   // ------------------------------
 
-  start_clock(mpi_rank, clock_type::all);
+  start_clock(mpi_rank, clock_type::loop);
 
 #if defined(CRAYPAT) && USE_PAT_API>0
   PAT_region_begin(1,"iteration_loop");
 #endif
 
 #if USE_MPI>1
-  MPI_Request bcast_BB_request, allgather_CC_request ;
+  MPI_Request  BB_request[mpi_split_num_call] ;
 #endif
 
-#if USE_OMP>1
-  #pragma omp parallel
-  {
-#if USE_ALGOR==4 && USE_OMP>1
-    std::size_t start_col_p, num_col_p, stripe_size_p ;
-    partition_dim(start_col_p, num_col_p, stripe_size_p,
-                  omp_get_thread_num(), omp_get_num_threads(), p_size);
-#endif
-#endif
+  // Main iteration loop == REPEAT
   for(int niter=0 ; niter < num_repeat ; ++niter)
   {
     if( mpi_rank == 0 ){  
 #if PRINT_LOOP_ITER>0
-#if USE_OMP>1
-      #pragma omp single nowait
-#endif
       std::cout << "Begin loop " << niter+1 << "/" << num_repeat << std::endl;
 #endif
-      init_random<Float>(BB, n_size*p_size);
-      // Implicit barrier
-    }
 
-#if USE_OMP>1 && USE_MPI>0
-    #pragma omp single nowait
+#if USE_MPI>2
+    }
 #endif
+#if USE_ALGOR!=4 || SELECT_BLAS!=2
+      init_random<Float>(&BB[rand_B_start_index], rand_B_num_row*p_size);
+#else 
+      init_random<Float>(&BB_device[rand_B_start_index], rand_B_num_row*p_size);
+#if USE_MPI>0 && (!defined(USE_MPI_GPU_DIRECT) || USE_MPI_GPU_DIRECT==0)
+      libsci_acc_Memcpy(&BB[rand_B_start_index], &BB_device[rand_B_start_index], 
+		        rand_B_num_row*p_size * sizeof(Float), libsci_acc_MemcpyDTH);
+#endif
+#endif
+#if USE_MPI<3
+    }
+#endif
+
+#if USE_MPI>0
     {
-#if USE_MPI==1
-      MPI_Bcast(&BB[0], n_size*p_size, CUSTOM_MPI_FLOAT, 0, MPI_COMM_WORLD);
-#elif USE_MPI>1
-      MPI_Ibcast(&BB[0], n_size*p_size, CUSTOM_MPI_FLOAT,
-                 0,
-                 MPI_COMM_WORLD, &bcast_BB_request);
-#endif 
-    }
+#if USE_MPI<3  // ###
 
-    init_random<Float>(&AA[0], stripe_size_m*n_size);
-    // Implicit barrier
-    //   Require one between MPI_Ibcast and MPI_Wait 
-    //   since MPI_THREAD_SERIALIZED is used
-
-#if USE_MPI>1 && USE_MPI_IO>0
-    if( niter!=0 ){
-#if USE_OMP>1
-      #pragma omp single
-#endif
+      for(int i=0 ; i<mpi_split_num_call ; ++i)
       {
-        MPI_Wait(&allgather_CC_request, MPI_STATUS_IGNORE);
-      } // <-- Implicit barrier of omp single 
+        const int start_index = i*mpi_split_Bsize ;
+        const int msg_size = (start_index+mpi_split_Bsize < rand_B_num_row*p_size) ? mpi_split_Bsize : (rand_B_num_row*p_size) - start_index ;
+
+#if USE_MPI==1
+#if USE_ALGOR!=4 || SELECT_BLAS!=2 || !defined(USE_MPI_GPU_DIRECT) || USE_MPI_GPU_DIRECT==0
+        MPI_Bcast(&BB[start_index], msg_size, CUSTOM_MPI_FLOAT, 0, MPI_COMM_WORLD);
+#else
+	MPI_Bcast(&BB_device[start_index], msg_size, CUSTOM_MPI_FLOAT, 0, MPI_COMM_WORLD);
+#endif
+#elif USE_MPI>1
+#if USE_ALGOR!=4 || SELECT_BLAS!=2 || !defined(USE_MPI_GPU_DIRECT) || USE_MPI_GPU_DIRECT==0
+        MPI_Ibcast(&BB[start_index], msg_size, CUSTOM_MPI_FLOAT, 0, MPI_COMM_WORLD, &BB_request[i]);
+#else
+        MPI_Ibcast(&BB_device[start_index], msg_size, CUSTOM_MPI_FLOAT, 0, MPI_COMM_WORLD, &BB_request[i]);
+#endif
+#endif // USE_MPI==1, USE_MPI>1
+     }
+
+#else // USE_MPI<3  ###
+      
+     // Cannot use with -DNUM_SPLIT_MPI_CALL != 1 
+#if USE_ALGOR!=4 || SELECT_BLAS!=2 || !defined(USE_MPI_GPU_DIRECT) || USE_MPI_GPU_DIRECT==0
+     MPI_Iallgatherv(MPI_IN_PLACE, mpi_bb_recv_size[mpi_rank], CUSTOM_MPI_FLOAT,
+                     &BB[0], mpi_bb_recv_size.data(), mpi_bb_recv_disp.data(), CUSTOM_MPI_FLOAT,
+                     MPI_COMM_WORLD, &BB_request[0]);
+#else
+     MPI_Iallgatherv(MPI_IN_PLACE, mpi_bb_recv_size[mpi_rank], CUSTOM_MPI_FLOAT,
+                     &BB_device[0], mpi_bb_recv_size.data(), mpi_bb_recv_disp.data(), CUSTOM_MPI_FLOAT,
+                     MPI_COMM_WORLD, &BB_request[0]);
+#endif
+
+#endif // USE_MPI<3 ###
     }
+#endif
+
+#if USE_MPI>0 && USE_MPI<2 && USE_ALGOR==4 && SELECT_BLAS==2 && (!defined(USE_MPI_GPU_DIRECT) || USE_MPI_GPU_DIRECT==0)
+    libsci_acc_Memcpy(&BB_device[rand_B_start_index], &BB[rand_B_start_index], 
+		      rand_B_num_row*p_size * sizeof(Float), libsci_acc_MemcpyHTD);
+    // BB == data_ptr
+#endif
+
+#if USE_ALGOR!=4 || SELECT_BLAS!=2
+    init_random<Float>(&AA[0], num_row_m*n_size);
+#else
+    init_random<Float>(&AA_device[0], num_row_m*n_size);
 #endif
 
 #if USE_ALGOR==1 || USE_ALGOR==2 || USE_ALGOR==3
-#if USE_OMP>1
-    #pragma omp for nowait
-#elif USE_OMP==1
+#if USE_OMP>0
     #pragma omp parallel for
 #endif
-    for(int i=start_row_m ; i<(start_row_m+stripe_size_m)*p_size ; ++i){
+    for(int i=0 ; i<num_row_m*p_size ; ++i){
       CC[i] = 0. ;
     }
 #endif
 
     // --- --- ---
 
-#if USE_OMP>1
-    #pragma omp single
-#endif
     {
 #if USE_MPI>1
-      MPI_Wait(&bcast_BB_request, MPI_STATUS_IGNORE);
+      MPI_Waitall(mpi_split_num_call, &BB_request[0], MPI_STATUS_IGNORE);
+#if USE_ALGOR==4 && SELECT_BLAS==2 && (!defined(USE_MPI_GPU_DIRECT) || USE_MPI_GPU_DIRECT==0)
+      libsci_acc_Memcpy(&BB_device[0], &BB[0],
+                        n_size*p_size * sizeof(Float), libsci_acc_MemcpyHTD);
 #endif
-      start_clock(mpi_rank, clock_type::computation);
+#endif
     }
-    // <-- Implicit barrir of omp single
-
 
     // --- --- ---
 
@@ -407,39 +532,30 @@ int main(int argc, char *argv[])
 #endif
 
 #if USE_ALGOR!=1 && USE_ALGOR!=2 && USE_ALGOR!=3 && USE_ALGOR!=4
-    matmul_trivial<Float>(&CC[p_size*start_row_m], AA, BB, num_row_m, p_size, n_size);
+    matmul_trivial<Float>(CC, AA, BB, num_row_m, p_size, n_size);
 #elif USE_ALGOR==1
-    matmul_loop_interchange<Float>(&CC[p_size*start_row_m], AA, BB, num_row_m, p_size, n_size);
+    matmul_loop_interchange<Float>(CC, AA, BB, num_row_m, p_size, n_size);
 #elif USE_ALGOR==2
-    matmul_cache_blocking<Float>(&CC[p_size*start_row_m], AA, BB, num_row_m, p_size, n_size);
+    matmul_cache_blocking<Float>(CC, AA, BB, num_row_m, p_size, n_size);
 #elif USE_ALGOR==3
-    matmul_micro_kernel<Float>(&CC[p_size*start_row_m], AA, BB, num_row_m, p_size, n_size);
+    matmul_micro_kernel<Float>(CC, AA, BB, num_row_m, p_size, n_size);
 #elif USE_ALGOR==4
 #if SELECT_BLAS!=2
-  #if USE_OMP>1
-    matmul_cblas<Float>(&CC[p_size*start_row_m+start_col_p], AA, &BB[start_col_p], 
-                        num_row_m, num_col_p, n_size,
-                        p_size, n_size, p_size
-                        );
-    #pragma omp barrier
-  #else
-    matmul_cblas<Float>(&CC[p_size*start_row_m], AA, BB, 
-                        num_row_m, p_size, n_size,
-                        p_size, n_size, p_size
-                        );
-  #endif
+    matmul_cblas<Float>(CC, AA, BB, 
+		        num_row_m, p_size, n_size,
+			p_size, n_size, p_size
+		       );
 #else // SELECT_BLAS
   #if USE_OMP==0
-    matmul_libsci_acc<Float>(&CC[p_size*start_row_m], AA, BB, 
-                             CC_device, AA_device, BB_device,
-                             num_row_m, p_size, n_size);
+    matmul_libsci_acc<Float>(CC, AA, BB, 
+		             CC_device, AA_device, BB_device,
+		             num_row_m, p_size, n_size
+			    );
   #else
     std::cerr << "ERROR :: Using libsci_acc.h with OpenMP is NOT supported!" << std::endl;
   #endif
 #endif // SELECT_BLAS
 #endif // USE_ALGOR
-  // <-- Implicit barrir of omp for
-  //     or explict barrier (cblas)
 
 #if defined(CRAYPAT) && USE_PAT_API>1
     PAT_region_end(2);
@@ -447,58 +563,47 @@ int main(int argc, char *argv[])
 
     // --- --- ---
 
-#if USE_OMP>1 && (USE_MPI>0 || USE_TIMER>0)
-    #pragma omp single 
-#endif
+#if WRITE_ARRAYS>0
     {
-      stop_clock(mpi_rank, clock_type::computation);
-#if USE_MPI>0
-#if USE_MPI>1
-      MPI_Iallgather(MPI_IN_PLACE, stripe_size_m*p_size, CUSTOM_MPI_FLOAT,
-                     &CC[0], stripe_size_m*p_size, CUSTOM_MPI_FLOAT,
-                     MPI_COMM_WORLD, &allgather_CC_request);
-#else
-      MPI_Allgather(MPI_IN_PLACE, stripe_size_m*p_size, CUSTOM_MPI_FLOAT,
-                    &CC[0], stripe_size_m*p_size, CUSTOM_MPI_FLOAT,
-                    MPI_COMM_WORLD);
-#endif
-#if WRITE_ARRAYS>0 && USE_MPI_IO<1
       if( niter % int(NUM_ITER_PER_WRITE) == 0 )
       {
+#if USE_ALGOR==4 && SELECT_BLAS==2
+	libsci_acc_Memcpy(AA, AA_device, num_row_m*n_size * sizeof(Float), libsci_acc_MemcpyDTH);
+        libsci_acc_Memcpy(CC, CC_device, num_row_m*p_size * sizeof(Float), libsci_acc_MemcpyDTH);
+#endif
+#if USE_MPI>0 && USE_MPI_IO<1
+	MPI_Request gather_req[2] ;
         if( mpi_rank == 0 ){
-          MPI_Gather(MPI_IN_PLACE, stripe_size_m*n_size, CUSTOM_MPI_FLOAT,
-                    &AA[0], stripe_size_m*n_size, CUSTOM_MPI_FLOAT,
-                    0, MPI_COMM_WORLD);
+          MPI_Igatherv(MPI_IN_PLACE, mpi_aa_recv_size[0], CUSTOM_MPI_FLOAT,
+                      &AA[0], mpi_aa_recv_size.data(), mpi_aa_recv_disp.data(), CUSTOM_MPI_FLOAT,
+                      0, MPI_COMM_WORLD, &gather_req[0]);
+	  MPI_Igatherv(MPI_IN_PLACE, mpi_cc_recv_size[0], CUSTOM_MPI_FLOAT,
+                      &CC[0], mpi_cc_recv_size.data(), mpi_cc_recv_disp.data(), CUSTOM_MPI_FLOAT,
+                      0, MPI_COMM_WORLD, &gather_req[1]);
         }else{
-          MPI_Gather(&AA[0], stripe_size_m*n_size, CUSTOM_MPI_FLOAT,
-                    nullptr, stripe_size_m*n_size, CUSTOM_MPI_FLOAT,
-                    0, MPI_COMM_WORLD);
+          MPI_Igatherv(&AA[0], num_row_m*n_size, CUSTOM_MPI_FLOAT,
+                      nullptr, nullptr, nullptr, CUSTOM_MPI_FLOAT,
+                      0, MPI_COMM_WORLD, &gather_req[0]);
+	  MPI_Igatherv(&CC[0], num_row_m*p_size, CUSTOM_MPI_FLOAT,
+                      nullptr, nullptr, nullptr, CUSTOM_MPI_FLOAT,
+                      0, MPI_COMM_WORLD, &gather_req[1]);
         }
-      }
+	MPI_Waitall(2, &gather_req[0], MPI_STATUS_IGNORE);
 #endif
-#endif
-    }
-    // <-- Implicit barrier of omp single
-    //     required between MPI_Iallgather (n) and MPI_Ibcast (n+1)
-    //     and obviously before wring AA and CC
-
+    
     // --- --- ---
 
-#if WRITE_ARRAYS>0
-#if USE_OMP>1
-    #pragma omp single
-#endif
-    {
-      if( niter % int(NUM_ITER_PER_WRITE) == 0 )
-      {
 #if USE_MPI_IO>0
+#if USE_ALGOR==4 && SELECT_BLAS==2 && USE_MPI_GPU_DIRECT>0
+        libsci_acc_Memcpy(&BB[start_row_n*p_size], &BB_device[start_row_n*p_size], num_row_n*p_size * sizeof(Float), libsci_acc_MemcpyDTH);
+#endif
         write_array_mpi<Float,CUSTOM_MPI_FLOAT>(
                         &AA[0], start_row_m*n_size, num_row_m*n_size,
                         "A_"+std::to_string(niter)+".bin"
-                        );
+	  	        );
         if( mpi_rank == 0 )
           std::cout << "  A matrix is written in binary format using MPI-IO." << std::endl;
-
+     
         write_array_mpi<Float,CUSTOM_MPI_FLOAT>(
                         &BB[start_row_n*p_size], start_row_n*p_size, num_row_n*p_size,
                         "B_"+std::to_string(niter)+".bin"
@@ -507,7 +612,7 @@ int main(int argc, char *argv[])
           std::cout << "  B matrix is written in binary format using MPI-IO." << std::endl;
 
         write_array_mpi<Float,CUSTOM_MPI_FLOAT>(
-                        &CC[start_row_m*p_size], start_row_m*p_size, num_row_m*p_size,
+                        &CC[0], start_row_m*p_size, num_row_m*p_size,
                         "C_"+std::to_string(niter)+".bin"
                         );
         if( mpi_rank == 0 )
@@ -516,56 +621,33 @@ int main(int argc, char *argv[])
 #else
         if( mpi_rank == 0 )
         {
+#if USE_ALGOR==4 && SELECT_BLAS==2 && USE_MPI_GPU_DIRECT>0
+          libsci_acc_Memcpy(BB, BB_device, n_size*p_size * sizeof(Float), libsci_acc_MemcpyDTH);
+#endif
           write_array<Float>(m_size, n_size, AA, "A_"+std::to_string(niter));
           std::cout << "  A matrix is written." << std::endl;
 
           write_array<Float>(n_size, p_size, BB, "B_"+std::to_string(niter));
           std::cout << "  B matrix is written." << std::endl;
 
-#if USE_MPI>1
-          MPI_Wait(&allgather_CC_request, MPI_STATUS_IGNORE);
-#endif
           write_array<Float>(m_size, p_size, CC, "C_"+std::to_string(niter));
           std::cout << "  C matrix is written." << std::endl;
-#if USE_MPI>1
-        }else{
-          MPI_Wait(&allgather_CC_request, MPI_STATUS_IGNORE);
         }
-#else
-        }
-#endif
-
 #endif // USE_MPI_IO
       } // niter % NUM_ITER_PER_WRITE
-    } // Implicit barrier of omp single
+    } 
 #endif // WRITE_ARRAYS
 
-  } // *** NUM_REPEAT loop ***
+  } // Main iteration loop ==  NUM_REPEAT
 
-#if USE_OMP>1
-  } // #pragma omp parallel
+#if USE_MPI>0
+  MPI_Barrier(MPI_COMM_WORLD);
 #endif
 
-
-#if USE_MPI>1
-  // Last call
-  if( num_repeat>0 )
-  {
-    MPI_Wait(&allgather_CC_request, MPI_STATUS_IGNORE);
-  }
-#endif
 #if defined(CRAYPAT) && USE_PAT_API>0
   PAT_region_end(1);
 #endif
-  stop_clock(mpi_rank, clock_type::all);
-
-  // ------------------------------
-
-  if( mpi_rank == 0 ){
-    std::cout << "\n-----" << std::endl;  
-  }
-  print_clock(mpi_rank, clock_type::computation,  "Main comp.");
-  print_clock(mpi_rank, clock_type::all,          "Main loops");
+  stop_clock(mpi_rank, clock_type::loop);
 
   // ------------------------------
 
@@ -576,10 +658,22 @@ int main(int argc, char *argv[])
   AA_device = BB_device = CC_device = nullptr ;
 #endif
 
-  free(AA);
-  free(BB);
-  free(CC);
+  std::free(AA);
+  std::free(BB);
+  std::free(CC);
   AA = BB = CC = nullptr ;
+
+  // ------------------------------
+
+  if( mpi_rank == 0 ){
+    std::cout << "\n-----" << std::endl;
+  }
+  print_clock(mpi_rank, clock_type::loop, "Main loops.");
+  stop_clock(mpi_rank, clock_type::prog);
+  print_clock(mpi_rank, clock_type::prog, "Whole prog.");
+
+  // ------------------------------
+
 
 #if USE_ALGOR==4 && SELECT_BLAS==2
   libsci_acc_finalize();

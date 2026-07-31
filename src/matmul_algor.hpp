@@ -1,10 +1,11 @@
 /******************************************************************\
 
-  Matmul -- perf tools
+  Matmul -- Perf. tools
 
-  Version 1.0.0
+  Version 2.0.0
   Copyright (c) 2026, Somrath Kanoksirirath <somrathk@gmail.com>
   All rights reserved under BSD 3-clause license.
+
 \******************************************************************/
 
 #ifndef MATMUL_ALGOR_HPP
@@ -20,18 +21,22 @@
 #endif
 #endif
 
-#include "matmul_setup.hpp"
-#include "matmul_kernel.hpp"
+#include <matmul_setup.hpp>
 
+#if USE_ALGOR==3
+  #include <matmul_kernel.hpp>
+#endif
 
 template <typename U>
 void matmul_trivial(U *__restrict CC, const U *__restrict AA, U *__restrict BB,
                     const int m_size, const int p_size, const int n_size)
 {
+#if USE_OMP>0
 #if USE_OMP>1
-  #pragma omp for schedule(runtime)
-#elif USE_OMP==1
+  #pragma omp parallel for collapse(2) schedule(runtime)
+#else
   #pragma omp parallel for schedule(runtime)
+#endif
 #endif
   for(int i=0 ; i < m_size ; ++i)
   for(int j=0 ; j < p_size ; ++j)
@@ -47,107 +52,86 @@ void matmul_trivial(U *__restrict CC, const U *__restrict AA, U *__restrict BB,
 return; }
 
 
+#if USE_ALGOR==1
 template <typename U>
 void matmul_loop_interchange(U *__restrict CC, const U *__restrict AA, U *__restrict BB,
                              const int m_size, const int p_size, const int n_size)
 {
+#if USE_OMP>0
 #if USE_OMP>1
-  #pragma omp for schedule(runtime)
-#elif USE_OMP==1
+  #warning "Using USE_ALGOR=1 with USE_OMP=2 requires atomic orcritical"
+  #pragma omp parallel for collapse(2) schedule(runtime)
+#else
   #pragma omp parallel for schedule(runtime)
+#endif
 #endif
   for(int i=0 ; i < m_size ; ++i)
   for(int k=0 ; k < n_size ; ++k)
   {
     for(int j=0 ; j < p_size ; ++j)
     {
+#if USE_OMP>1
+      Float value = AA[n_size*i+k] * BB[p_size*k+j];
+      //#pragma omp atomic/critical
+      #pragma omp atomic
+      CC[p_size*i+j] += value;
+#else
       CC[p_size*i+j] += AA[n_size*i+k] * BB[p_size*k+j] ;
+#endif
     }
   }
 
 return; }
+#endif
 
 
+#if USE_ALGOR==2
 template <typename U>
 void matmul_cache_blocking(U *__restrict CC, const U *__restrict AA, U *__restrict BB,
                            const int m_size, const int p_size, const int n_size)
 {
+
+#if USE_OMP>0
 #if USE_OMP>1
-  #pragma omp for schedule(runtime)
-#elif USE_OMP==1
+  #pragma omp parallel for collapse(2) schedule(runtime)
+#else
   #pragma omp parallel for schedule(runtime)
 #endif
-  //  {M,P}  =  {M,N}  x  {N,P}
-  // {ii,jj} = {ii,kk} x {kk,jj}
+#endif
   for(int jj=0 ; jj < p_size ; jj+=BLOCK_P_SIZE)
+  for(int ii=0 ; ii < m_size ; ii+=BLOCK_M_SIZE)
+  for(int kk=0 ; kk < n_size ; kk+=BLOCK_N_SIZE)
   {
-    for(int kk=0 ; kk < n_size ; kk+=BLOCK_N_SIZE)
+    for(int i=ii ; i < ii+BLOCK_M_SIZE ; ++i)
+    for(int k=kk ; k < kk+BLOCK_N_SIZE ; ++k)
     {
-      for(int ii=0 ; ii < m_size ; ii+=BLOCK_M_SIZE)
+      const U AA_value = AA[n_size*i+k] ;
+      for(int j=jj ; j < jj+BLOCK_P_SIZE ; ++j)
       {
-        for(int i=ii ; i < ii+BLOCK_M_SIZE ; ++i)
-        {
-          for(int k=kk ; k < kk+BLOCK_N_SIZE ; ++k)
-          {
-            const U AA_value = AA[n_size*i+k] ;
-            for(int j=jj ; j < jj+BLOCK_P_SIZE ; ++j)
-            {
-              CC[p_size*i+j] += AA_value * BB[p_size*k+j] ;
-            }
-          }
-        }
+        CC[p_size*i+j] += AA_value * BB[p_size*k+j] ;
       }
     }
   }
+
 return; }
+#endif
 
 
+#if USE_ALGOR==3
 template <typename U>
 void matmul_micro_kernel(U *__restrict CC, const U *__restrict AA, U *__restrict BB,
                          const int m_size, const int p_size, const int n_size)
 {
   alignas(SIMD_ALIGNED_BYTE) static U BB_block[BLOCK_N_SIZE*MICRO_P_SIZE*NUM_PANEL_P] ;
-#if !defined(ALGOR3_NO_MERGE_LOOP) || ALGOR3_NO_MERGE_LOOP<1
-  alignas(SIMD_ALIGNED_BYTE) static U AA_block_trans[BLOCK_N_SIZE*MICRO_M_SIZE] ;
-#if USE_OMP>1
-  #pragma omp for private(BB_block,AA_block_trans) schedule(runtime)
-#elif USE_OMP==1
-  #pragma omp parallel for private(BB_block,AA_block_trans) schedule(runtime)
-#endif
-  //  {M,P}  =  {M,N}  x  {N,P}
-  // {ii,jj} = {ii,kk} x {kk,jj}
-  for(int jj=0 ; jj < p_size ; jj+=BLOCK_P_SIZE)
-  {
-    for(int kk=0 ; kk < n_size ; kk+=BLOCK_N_SIZE)
-    {
-      pack_array<U,BLOCK_N_SIZE,MICRO_P_SIZE,NUM_PANEL_P>
-                (BB_block,&BB[p_size*kk+jj], p_size,1,MICRO_P_SIZE);
 
-      for(int ii=0 ; ii < m_size ; ii+=MICRO_M_SIZE)
-      {
-        pack_array<U,BLOCK_N_SIZE,MICRO_M_SIZE,1>
-                  (AA_block_trans,&AA[n_size*ii+kk], 1,n_size, 0);
+#if !defined(USE_OMP) || USE_OMP<2
 
-        for(int jc=0 ; jc < BLOCK_P_SIZE ; jc+=MICRO_P_SIZE)
-        {
-          micro_kernel<U,MICRO_M_SIZE,MICRO_P_SIZE,BLOCK_N_SIZE>
-                      (&CC[p_size*ii+(jj+jc)], p_size,
-                       AA_block_trans,
-                       &BB_block[BLOCK_N_SIZE*jc]
-                      );
-        } // jc
-      } // ii
-    } // kk
-  } //jj
-#else
+#if !defined(ALGOR3_MERGE_LOOP_PACK_LOCAL) || ALGOR3_MERGE_LOOP_PACK_LOCAL<1
+
   alignas(SIMD_ALIGNED_BYTE) static U AA_block_trans[BLOCK_N_SIZE*MICRO_M_SIZE*NUM_PANEL_M] ;
-#if USE_OMP>1
-  #pragma omp for private(BB_block,AA_block_trans) schedule(runtime)
-#elif USE_OMP==1
+#if USE_OMP>0
   #pragma omp parallel for private(BB_block,AA_block_trans) schedule(runtime)
 #endif
-  //  {M,P}  =  {M,N}  x  {N,P}
-  // {ii,jj} = {ii,kk} x {kk,jj}
   for(int jj=0 ; jj < p_size ; jj+=BLOCK_P_SIZE)
   {
     for(int kk=0 ; kk < n_size ; kk+=BLOCK_N_SIZE)
@@ -174,9 +158,72 @@ void matmul_micro_kernel(U *__restrict CC, const U *__restrict AA, U *__restrict
       } // ii
     } // kk
   } //jj
+    
+#else // ALGOR3_MERGE_LOOP_PACK_LOCAL
+
+  alignas(SIMD_ALIGNED_BYTE) static U AA_block_trans[BLOCK_N_SIZE*MICRO_M_SIZE] ;
+#if USE_OMP>0
+  #pragma omp parallel for private(BB_block,AA_block_trans) schedule(runtime)
 #endif
+  for(int jj=0 ; jj < p_size ; jj+=BLOCK_P_SIZE)
+  {
+    for(int kk=0 ; kk < n_size ; kk+=BLOCK_N_SIZE)
+    {
+      pack_array<U,BLOCK_N_SIZE,MICRO_P_SIZE,NUM_PANEL_P>
+                (BB_block,&BB[p_size*kk+jj], p_size,1,MICRO_P_SIZE);
+
+      for(int ii=0 ; ii < m_size ; ii+=MICRO_M_SIZE)
+      {
+        pack_array<U,BLOCK_N_SIZE,MICRO_M_SIZE,1>
+                  (AA_block_trans,&AA[n_size*ii+kk], 1,n_size, 0);
+
+        for(int jc=0 ; jc < BLOCK_P_SIZE ; jc+=MICRO_P_SIZE)
+        {
+          micro_kernel<U,MICRO_M_SIZE,MICRO_P_SIZE,BLOCK_N_SIZE>
+                      (&CC[p_size*ii+(jj+jc)], p_size,
+                       AA_block_trans,
+                       &BB_block[BLOCK_N_SIZE*jc]
+                      );
+        } // jc
+      } // ii
+    } // kk
+  } //jj
+
+#endif // ALGOR3_MERGE_LOOP_PACK_LOCAL
+
+
+#else
+  alignas(SIMD_ALIGNED_BYTE) static U AA_block_trans[BLOCK_N_SIZE*MICRO_M_SIZE*NUM_PANEL_M] ;
+  //alignas(SIMD_ALIGNED_BYTE) static U AA_block_trans[BLOCK_N_SIZE*MICRO_M_SIZE] ;
+  
+  #pragma omp parallel for collapse(2) private(BB_block,AA_block_trans) schedule(runtime)
+  for(int jj=0 ; jj < p_size ; jj+=BLOCK_P_SIZE)
+  for(int ii=0 ; ii < m_size ; ii+=BLOCK_M_SIZE)
+  for(int kk=0 ; kk < n_size ; kk+=BLOCK_N_SIZE)
+  {
+    pack_array<U,BLOCK_N_SIZE,MICRO_P_SIZE,NUM_PANEL_P>(BB_block,&BB[p_size*kk+jj], p_size,1,MICRO_P_SIZE);
+    pack_array<U,BLOCK_N_SIZE,MICRO_M_SIZE,NUM_PANEL_M>(AA_block_trans,&AA[n_size*ii+kk], 1,n_size,MICRO_M_SIZE*n_size);
+
+    // ----- From cache blocking to micro kernel -----
+    for(int ic=0 ; ic < BLOCK_M_SIZE ; ic+=MICRO_M_SIZE)
+    {
+      //pack_array<U,BLOCK_N_SIZE,MICRO_M_SIZE,1>(AA_block_trans,&AA[n_size*(ii+ic)+kk], 1,n_size,0);
+
+      for(int jc=0 ; jc < BLOCK_P_SIZE ; jc+=MICRO_P_SIZE)
+      {
+        micro_kernel<U,MICRO_M_SIZE,MICRO_P_SIZE,BLOCK_N_SIZE>
+                    (&CC[p_size*(ii+ic)+(jj+jc)], p_size,
+                     &AA_block_trans[BLOCK_N_SIZE*ic],
+                     &BB_block[BLOCK_N_SIZE*jc]
+                    );
+      } // jc
+    } // ic
+    // ----- From micro kernel to cache blocking -----
+  }
+#endif 
 
 return; }
+#endif
 
 
 #if USE_ALGOR==4 
@@ -215,9 +262,6 @@ void matmul_libsci_acc(U *__restrict CC, U *__restrict AA, U *__restrict BB,
 		       U *CC_device, U *AA_device, U *BB_device,
                        const int m_size, const int p_size, const int n_size)
 {
-  libsci_acc_Memcpy(AA_device, AA, m_size*n_size * sizeof(U), libsci_acc_MemcpyHTD);
-  libsci_acc_Memcpy(BB_device, BB, n_size*p_size * sizeof(U), libsci_acc_MemcpyHTD);
-
   if constexpr ( sizeof(U) == 8 ){
     dgemm_acc('N', 'N', p_size, m_size, n_size,
               1.0,
@@ -235,7 +279,6 @@ void matmul_libsci_acc(U *__restrict CC, U *__restrict AA, U *__restrict BB,
   }else{
     static_assert(sizeof(U)==4 || sizeof(U)==8, "matmul_libsci_acc only supports double and float");
   }
-  libsci_acc_Memcpy(CC, CC_device, m_size*p_size * sizeof(U), libsci_acc_MemcpyDTH);
 
 return; }
 

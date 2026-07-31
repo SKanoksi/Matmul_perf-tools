@@ -1,16 +1,17 @@
 /******************************************************************\
 
-  Matmul -- perf tools
+  Matmul -- Perf. tools
 
-  Version 1.0.0
+  Version 2.0.0
   Copyright (c) 2026, Somrath Kanoksirirath <somrathk@gmail.com>
   All rights reserved under BSD 3-clause license.
+
 \******************************************************************/
 
 #ifndef MATMUL_KERNEL_HPP
 #define MATMUL_KERNEL_HPP
 
-#include "matmul_setup.hpp"
+#include <matmul_setup.hpp>
 
 
 template <typename U, int num_rows, int num_cols, int num_col_packs>

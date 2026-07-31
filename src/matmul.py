@@ -3,9 +3,9 @@ import sys
 
 REPEAT = 100
 
-M_SIZE = 3000
-N_SIZE = 3000
-P_SIZE = 3000
+M_SIZE = 4000
+N_SIZE = 4000
+P_SIZE = 4000
 
 if len(sys.argv) > 1 :
     REPEAT = int(sys.argv[1])
