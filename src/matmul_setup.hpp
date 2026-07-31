@@ -54,6 +54,7 @@ using Float = double ;
   #define USE_OMP 0
 //  0 = No OpenMP
 //  1 = Simple, omp parallel for
+//  2 = Simple, omp parallel for collapse(..)
 #endif
 #if !defined(USE_MPI)
   #define USE_MPI 0
